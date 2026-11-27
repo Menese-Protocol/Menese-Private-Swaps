@@ -1,0 +1,23 @@
+# The record verify-build.sh checks against. No script writes this file.
+# Format: <sha256>  <file in the build output>  [swap=<swap canister id>]
+
+# The swap canister. Its module does not depend on the swap canister id.
+b4ed25579e817593e4a6d721a127cea979a6327e0c142800540d9fc0b3dc0572  swap.wasm
+035d8bcf1d8166414b2071741fcb5826cb26b405573ef5a570ab444fe81c5e09  swap.wasm.gz
+0976c9e9ec0777e29a88659554798a4280165a69cce579a1d7b165954202480f  swap.did
+
+# The pools' hardening release (proposals H1 and H2), built from pool/src with pool/SWAP-DIFF.patch
+# reversed. Its modules do not depend on the swap canister id. H1 and H2 give the .gz hash.
+05f4c35ff90602e0b97fe9ce4b0501a25c0069bc5456aed653dad340ce98bef8  hardening-ckbtc.wasm
+059ad44527a6748b917d97e36e5b8489664ad4ec0bd64e3fc2d567c636d47694  hardening-icp.wasm
+a608cb5545c23dfc2818bdf5aed163d7029496d9c92044c0cc58110b12d8622b  hardening-ckbtc.wasm.gz
+96eaf303ad2eefb3ddee0c0eabeadf2a49af6ddcf00688ca351f0af4d6d6252e  hardening-icp.wasm.gz
+
+# The modules the two pools run today (read 2026-11-27 with `dfx canister --network ic info`):
+# the ckBTC pool and the ICP pool (sources in pool/UPSTREAM.txt). The build reproduces
+# them from the hardening source with pool/HARDENING.patch reversed as well.
+4c26e0669b33f03679fc9fa11e8aa06e760b4b8beccf54edf601022d8a08014b  upstream-ckbtc.wasm
+df8453a91cda7dc894024219ecfcabdbc1dc6660b37138d551eca4a24e52be6e  upstream-icp.wasm
+
+# The pool upgrades depend on the swap canister id, which is not assigned yet. Their lines are added
+# here, with swap=<id>, once it is.

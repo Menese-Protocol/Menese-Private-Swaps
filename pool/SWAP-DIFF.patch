@@ -1,0 +1,753 @@
+diff --git a/pool/src/Main.mo b/pool/src/Main.mo
+index 62a6fc9..3d29b29 100644
+--- a/pool/src/Main.mo
++++ b/pool/src/Main.mo
+@@ -46,11 +46,10 @@ import NoteCodec "NoteCodec";
+ import Pir2 "Pir2";
+ import PoseidonTree "PoseidonTree";
+ import ProofGate "ProofGate";
+-import ProofGuardMigration "ProofGuardMigration";
+ import StableBlobSet "StableBlobSet";
+ import StableLog "StableLog";
++import SwapConfig "SwapConfig";
+ 
+-(with migration = ProofGuardMigration.migrate)
+ persistent actor ZkLedger {
+   public type Result<T> = { #ok : T; #err : Text };
+ 
+@@ -280,8 +279,9 @@ persistent actor ZkLedger {
+         reserved : Nat;
+         // #sweep moves protocol-fee revenue from the POOL account into the protocol treasury
+         // subaccount (protocol_fee_sweep); #treasury pays out of that subaccount
+-        // (protocol_treasury_withdraw).
+-        source : { #balance; #revenue; #sweep; #treasury };
++        // (protocol_treasury_withdraw); #swap_reserve pays the private-swap reserve out of the
++        // POOL account to SNS governance's treasury account (swap_reserve_payout).
++        source : { #balance; #revenue; #sweep; #treasury; #swap_reserve };
+         transfer_args : ICRC2.TransferArg;
+       };
+     };
+@@ -342,13 +342,17 @@ persistent actor ZkLedger {
+     recipient : ?ICRC2.Account;
+     revenue : Nat;
+     transparent_ledger_fee : Nat;
+-    /// What the pool account holds at rest: pool_value + revenue. While a sweep is in flight
++    /// What the pool account holds at rest: pool_value + revenue + swap_reserve. While a sweep is in flight
+     /// its reservation has already left `revenue` but not yet the account.
+     pool_custody_at_rest : Nat;
+     /// Protocol fees already swept out of the pool, held in the ledger's own treasury subaccount.
+     /// At rest the treasury account's token balance equals this.
+     treasury : Nat;
+     treasury_account : ICRC2.Account;
++    /// The private-swap reserve record: what the swap canister's providers hold in this pool's
++    /// token, inside the pool account. Counted in pool_custody_at_rest. While a reserve payout is
++    /// in flight its reservation has already left `swap_reserve` but not yet the account.
++    swap_reserve : Nat;
+   };
+ 
+   /// The publicly visible shape of an in-flight token intent.
+@@ -4594,7 +4598,7 @@ persistent actor ZkLedger {
+     };
+     let verdict = verifyShieldProof(args.proof_hex, inputs);
+     if (verdict != "ACCEPT") {
+-      recordFailedVerification(verdict, paid);
++      recordFailedVerification(verdict, if (paid) null else ?proof_gate);
+       return mutation(verdict, verdict);
+     };
+ 
+@@ -5177,7 +5181,7 @@ persistent actor ZkLedger {
+ 
+   func prepaidWithdrawIntentId(
+     caller : Principal,
+-    source : { #balance; #revenue; #sweep; #treasury },
++    source : { #balance; #revenue; #sweep; #treasury; #swap_reserve },
+     to : ICRC2.Account,
+     amount : Nat64,
+     createdAt : Nat64,
+@@ -5190,6 +5194,7 @@ persistent actor ZkLedger {
+       case (#revenue) "revenue";
+       case (#sweep) "sweep";
+       case (#treasury) "treasury";
++      case (#swap_reserve) "swap_reserve";
+     })));
+     List.add(entries, ("to_owner", #Blob(Principal.toBlob(to.owner))));
+     switch (to.subaccount) {
+@@ -5263,6 +5268,7 @@ persistent actor ZkLedger {
+           case (#balance) prepaidFeeBalance(pending.caller);
+           case (#revenue) prepaid_fee_revenue;
+           case (#sweep or #treasury) protocol_treasury_balance;
++          case (#swap_reserve) swap_reserve;
+         }
+       };
+     }
+@@ -5279,6 +5285,7 @@ persistent actor ZkLedger {
+           case (#revenue) prepaid_fee_revenue += op.reserved;
+           case (#sweep) protocol_fee_revenue += op.reserved;
+           case (#treasury) protocol_treasury_balance += op.reserved;
++          case (#swap_reserve) swap_reserve += op.reserved;
+         }
+       };
+     }
+@@ -5295,6 +5302,8 @@ persistent actor ZkLedger {
+         // landed in the treasury subaccount (its token fee is burned by the token ledger)
+         switch (op.source) {
+           case (#sweep) protocol_treasury_balance += op.transfer_args.amount;
++          // the reservation (payout + token fee) left the reserve when the intent was created
++          case (#swap_reserve) swap_paid_total += op.reserved;
+           case (_) {};
+         };
+       };
+@@ -5518,7 +5527,7 @@ persistent actor ZkLedger {
+ 
+   func prepaidPayout(
+     caller : Principal,
+-    source : { #balance; #revenue; #sweep; #treasury },
++    source : { #balance; #revenue; #sweep; #treasury; #swap_reserve },
+     to : ICRC2.Account,
+     amount : Nat64,
+     createdAt : Nat64,
+@@ -5530,6 +5539,7 @@ persistent actor ZkLedger {
+         case (#balance) prepaidFeeBalance(caller);
+         case (#revenue) prepaid_fee_revenue;
+         case (#sweep or #treasury) protocol_treasury_balance;
++        case (#swap_reserve) swap_reserve;
+       }
+     };
+     if (prepaidCompleted(intentId)) return #ok(answer());
+@@ -5537,7 +5547,7 @@ persistent actor ZkLedger {
+       // Unswept protocol revenue is held in the POOL account (it never left it); swept revenue in
+       // the treasury subaccount; prepaid custody in its own.
+       from_subaccount = switch (source) {
+-        case (#sweep) pool_subaccount;
++        case (#sweep or #swap_reserve) pool_subaccount;
+         case (#treasury) ?protocol_treasury_subaccount;
+         case (_) ?prepaid_fee_subaccount;
+       };
+@@ -5572,6 +5582,10 @@ persistent actor ZkLedger {
+         if (protocol_treasury_balance < reserved) return #err("REJECT:protocol-treasury-insufficient");
+         protocol_treasury_balance -= reserved;
+       };
++      case (#swap_reserve) {
++        if (swap_reserve < reserved) return #err("REJECT:swap-reserve-floor");
++        swap_reserve -= reserved;
++      };
+     };
+     pending_prepaid := ?{
+       intent_id = intentId;
+@@ -5631,9 +5645,10 @@ persistent actor ZkLedger {
+       recipient = protocol_fee_recipient;
+       revenue = protocol_fee_revenue;
+       transparent_ledger_fee;
+-      pool_custody_at_rest = pool_value + protocol_fee_revenue;
++      pool_custody_at_rest = pool_value + protocol_fee_revenue + swap_reserve;
+       treasury = protocol_treasury_balance;
+       treasury_account = protocolTreasuryAccount();
++      swap_reserve;
+     }
+   };
+ 
+@@ -5780,6 +5795,506 @@ persistent actor ZkLedger {
+     await prepaidPayout(caller, #treasury, to, amount, createdAt)
+   };
+ 
++  // ==================== private swaps ====================
++  //
++  // PROPOSAL-private-swaps-v2.md with the rulings of 2026-11-26. The swap canister named in this
++  // module (SwapConfig.SWAP_CANISTER, covered by the module hash the DAO votes on) is the only
++  // caller of every swap_* update method. None of them calls the swap canister back, and none
++  // awaits a token ledger except the payout, which rides the crash-safe prepaid rail above.
++  //
++  // Custody identity at rest:   pool account == pool_value + protocol_fee_revenue + swap_reserve
++  //
++  // swap_reserve rises only by a lock this pool verified itself (swap_lock) or by an SNS-treasury
++  // ICP block this pool read itself (swap_reserve_credit). It falls only by a collect, a fee sweep
++  // into revenue, or a payout to SNS governance's own treasury account, and each of those refuses
++  // when the record is smaller: whatever the swap canister owes, this pool never pays out more
++  // than its providers put in, and the notes of holders who did not take part stay fully backed.
++
++  public type SwapLockArgs = {
++    anchor : Blob;
++    nullifier_1 : Blob;
++    nullifier_2 : Blob;
++    output_1 : OutputRecord;
++    output_2 : OutputRecord;
++    fee : Nat64;
++    v_pub_out : Nat64;
++    proof_hex : Text;
++    /// the swap canister's caller: the one-time principal that will collect the result
++    owner : Principal;
++    /// the swap's terms in the swap canister's own fixed encoding; opaque here, bound by the proof
++    terms : Blob;
++  };
++  public type SwapLock = {
++    lock_id : Nat64;
++    owner : Principal;
++    terms : Blob;
++    amount : Nat64;
++    fee : Nat64;
++    time : Int;
++  };
++  public type SwapCollectArgs = {
++    owed_id : Nat64;
++    amount : Nat64;
++    commitment : Blob;
++    ephemeral_key : Blob;
++    note_ciphertext : Blob;
++    proof_hex : Text;
++  };
++  public type SwapStatus = {
++    enabled : Bool;
++    swap_canister : Principal;
++    reserve : Nat;
++    locked_total : Nat;
++    collected_total : Nat;
++    swept_total : Nat;
++    credited_total : Nat;
++    paid_total : Nat;
++    lock_count : Nat;
++    collect_count : Nat;
++    sweep_count : Nat;
++    payout_pending : Bool;
++    /// unpaid swap_lock / swap_collect verifications that failed in the current window, and
++    /// whether that window's budget is spent (the pool's own bound; see swap_proof_gate)
++    unpaid_proof_failures : Nat;
++    unpaid_proof_budget_spent : Bool;
++  };
++  public type SwapPayoutState = { #done; #pending; #none };
++
++  transient let SWAP_CANISTER : Principal = Principal.fromText(SwapConfig.SWAP_CANISTER);
++  transient let SWAP_TERMS_MAX : Nat = 256;
++  transient let SWAP_PAGE_MAX : Nat = 200;
++  /// The memo of the DAO's seed transfer (proposal 20): the first 8 bytes of
++  /// SHA-256("mpv/private-swaps/hub-seed/v1"), read big-endian.
++  transient let SWAP_SEED_MEMO : Nat64 = 5_423_582_789_349_015_861;
++
++  var swap_enabled : Bool = false;
++  /// The pool's own bound on what an unpaid swap_lock / swap_collect costs it: their failed
++  /// verifications count against this gate's budget (the proof gate's window and budget), not the
++  /// shield/transfer gate's. The swap canister prices these calls first (paid or work); this
++  /// bound holds even if its gate fails. A paid call (verify_price attached) is verified
++  /// unconditionally, as on shield.
++  var swap_proof_gate : ProofGate.Gate = ProofGate.newGate(0);
++  var swap_reserve : Nat = 0;
++  var swap_locked_total : Nat = 0;
++  var swap_collected_total : Nat = 0;
++  var swap_swept_total : Nat = 0;
++  var swap_credited_total : Nat = 0;
++  var swap_paid_total : Nat = 0;
++  /// Every lock, in lock-id order (lock_id == position). The swap canister recovers a lock whose
++  /// reply it never processed by reading this log.
++  let swap_locks = List.empty<SwapLock>();
++  /// owed id -> amount: a collect happens at most once per owed record.
++  let swap_collected = Map.empty<Nat64, Nat>();
++  /// sweep id -> amount: a fee sweep happens at most once per id.
++  let swap_sweeps = Map.empty<Nat64, Nat>();
++  /// ICP block -> amount: a seed block is credited at most once.
++  let swap_credited_blocks = Map.empty<Nat64, Nat>();
++
++  func isSwapCanister(caller : Principal) : Bool { Principal.equal(caller, SWAP_CANISTER) };
++
++  /// The tree a lock or collect computed its transition from is still the pool's tree. Every
++  /// ordinary commit moves `epoch`, which both paths re-check; `repair_tree_state` does not, so
++  /// the tree itself is compared as well, and a transition computed from a tree that is no longer
++  /// current can never be written over it.
++  func swapTreeUnchanged(before : TreeState) : Bool {
++    let now = currentTree();
++    now.root == before.root and now.next_index == before.next_index and Array.equal<Text>(now.filled, before.filled, Text.equal)
++  };
++
++  /// Why a lock or collect must not start (or must not commit after an await) now, or null.
++  /// The same gates a private transfer has, plus the DAO's switch.
++  func swapIntakeRejection() : ?Text {
++    switch (guardRejection()) { case (?message) return ?message; case null {} };
++    if (not configured()) return ?"REJECT:unconfigured";
++    if (not tokenConfigured()) return ?"REJECT:token-unconfigured";
++    if (state_quarantine) return ?"REJECT:state-quarantined";
++    if (not tree_frontier_enabled) return ?"REJECT:frontier-disabled";
++    if (not swap_enabled) return ?"REJECT:swaps-disabled";
++    // the tree-order rule of private transfers: no tree mutation while a token intent is pending
++    if (pending_shield != null or pending_unshield != null) return ?"REJECT:pending-token-mutation";
++    null
++  };
++
++  /// The `recipient_binding` a lock proves: ICRC-3 hash of the domain, this pool, its token, the
++  /// swap canister, the owner and the terms, high byte cleared (the reduction of
++  /// recipientBindingValue). A lock proof can therefore not be replayed into another pool, another
++  /// token, another swap canister, another owner or other terms, nor used as a transfer or an
++  /// unshield (different domains).
++  func swapLockBindingValue(owner : Principal, terms : Blob) : Result<Blob> {
++    let token = switch (token_ledger_id) {
++      case (?value) value;
++      case null return #err("REJECT:token-unconfigured");
++    };
++    let entries = List.empty<(Text, ICRC3.Value)>();
++    List.add(entries, ("domain", #Text("picp-swap-lock/v1")));
++    List.add(entries, ("pool", #Blob(Principal.toBlob(selfPrincipal()))));
++    List.add(entries, ("token", #Blob(Principal.toBlob(token))));
++    List.add(entries, ("swap", #Blob(Principal.toBlob(SWAP_CANISTER))));
++    List.add(entries, ("owner", #Blob(Principal.toBlob(owner))));
++    List.add(entries, ("terms", #Blob(terms)));
++    let digest = Blob.toArray(ICRC3.hashValue(#Map(List.toArray(entries))));
++    if (digest.size() != 32) return #err("REJECT:swap-binding-hash");
++    #ok(Blob.fromArray(Array.tabulate<Nat8>(32, func(i) { if (i == 31) 0 else digest[i] })))
++  };
++
++  /// Lock: verify a transfer proof whose public value leaves the notes for the swap reserve, burn
++  /// its two input notes, append its two change notes, move its flat fee into revenue and raise
++  /// the reserve record, all in one commit. No token moves.
++  public shared ({ caller }) func swap_lock(args : SwapLockArgs) : async Result<SwapLock> {
++    if (not isSwapCanister(caller)) return #err("REJECT:not-swap-canister");
++    switch (swapIntakeRejection()) { case (?e) return #err(e); case null {} };
++    if (transfer_statement_version != 2) return #err("REJECT:transfer-statement-version");
++    if (args.terms.size() == 0 or args.terms.size() > SWAP_TERMS_MAX) return #err("REJECT:swap-terms-size");
++    if (args.v_pub_out == 0) return #err("REJECT:swap-zero-value");
++    if (Principal.isAnonymous(args.owner)) return #err("REJECT:swap-anonymous-owner");
++    if (not fieldSized(args.anchor) or not fieldSized(args.nullifier_1) or not fieldSized(args.nullifier_2)) {
++      return #err("REJECT:field-length");
++    };
++    switch (validateOutput(args.output_1)) { case (?e) return #err(e); case null {} };
++    switch (validateOutput(args.output_2)) { case (?e) return #err(e); case null {} };
++    switch (shapeRejection(args.output_1.ephemeral_key, args.output_1.note_ciphertext)) { case (?e) return #err(e); case null {} };
++    switch (shapeRejection(args.output_2.ephemeral_key, args.output_2.note_ciphertext)) { case (?e) return #err(e); case null {} };
++    let binding = switch (swapLockBindingValue(args.owner, args.terms)) {
++      case (#ok(value)) value;
++      case (#err(message)) return #err(message);
++    };
++    if (not StableBlobSet.contains(historical_roots, args.anchor)) return #err("REJECT:unknown-anchor");
++    // the nullifier guards of confidential_transfer (audit F1a/F2), in the same order
++    if (PoseidonTree.blobToNat(args.nullifier_1) == null or PoseidonTree.blobToNat(args.nullifier_2) == null) {
++      return #err("REJECT:nullifier-noncanonical");
++    };
++    if (args.nullifier_1 == args.nullifier_2) return #err("REJECT:duplicate-nullifier-in-tx");
++    if (StableBlobSet.contains(spent_nullifiers, args.nullifier_1) or
++        StableBlobSet.contains(spent_nullifiers, args.nullifier_2)) {
++      return #err("REJECT:nullifier-spent");
++    };
++    let value = Nat64.toNat(args.v_pub_out);
++    let fee = Nat64.toNat(args.fee);
++    if (value + fee > pool_value) return #err("REJECT:turnstile");
++    let inputs = switch (serializePublicInputs([
++      args.anchor,
++      args.nullifier_1,
++      args.nullifier_2,
++      args.output_1.commitment,
++      args.output_2.commitment,
++      nat64Field(args.fee),
++      nat64Field(args.v_pub_out),
++      binding,
++    ])) {
++      case (?encoded) encoded;
++      case null return #err("REJECT:public-input-encoding");
++    };
++    let startEpoch = epoch;
++    let paid = takePaid<system>();
++    if (not paid) {
++      switch (swapUnpaidGate()) { case (?e) return #err(e); case null {} };
++    };
++    let verdict = verifyTransferProof(args.proof_hex, inputs);
++    if (verdict != "ACCEPT") {
++      recordFailedVerification(verdict, if (paid) null else ?swap_proof_gate);
++      return #err(verdict);
++    };
++    let treeBefore = currentTree();
++    let leaves = [blobToHex(args.output_1.commitment), blobToHex(args.output_2.commitment)];
++    for (leaf in leaves.vals()) {
++      switch (PoseidonTree.parseFieldElement(leaf)) { case (?_) {}; case null return #err("REJECT:commitment-noncanonical") };
++    };
++    let localNext = switch (frontierLocalNext(treeBefore, leaves)) {
++      case (#ok(value)) value;
++      case (#err(message)) return #err(message);
++    };
++    let transition = switch (localNext) {
++      case (?local) {
++        if (tree_oracle_id == null) { { state = ?local; error = null } : TreeTransition } else {
++          try { await treeActor().append(treeBefore, leaves) } catch (error) {
++            return #err("REJECT:tree-oracle-call:" # Error.message(error));
++          }
++        }
++      };
++      case null {
++        try { await treeActor().append(treeBefore, leaves) } catch (error) {
++          return #err("REJECT:tree-oracle-call:" # Error.message(error));
++        }
++      };
++    };
++    // Every check made before the await, made again: nothing was written before it.
++    switch (swapIntakeRejection()) { case (?e) return #err(e); case null {} };
++    if (epoch != startEpoch) return #err("REJECT:state-changed");
++    if (not swapTreeUnchanged(treeBefore)) return #err("REJECT:state-changed");
++    if (not StableBlobSet.contains(historical_roots, args.anchor)) return #err("REJECT:unknown-anchor");
++    if (StableBlobSet.contains(spent_nullifiers, args.nullifier_1) or
++        StableBlobSet.contains(spent_nullifiers, args.nullifier_2)) {
++      return #err("REJECT:nullifier-spent");
++    };
++    if (value + fee > pool_value) return #err("REJECT:turnstile");
++    let next = switch (parseTransition(transition)) {
++      case (#ok(state)) state;
++      case (#err(message)) return #err(message);
++    };
++    switch (frontierCrossCheck(localNext, next, "swap-lock")) { case (?message) return #err(message); case null {} };
++    let rootAfter = switch (hexToBlob(next.root)) {
++      case (?root) root;
++      case null return #err("REJECT:tree-root-hex");
++    };
++    // No await after this point: the lock commits whole or not at all.
++    pool_value -= value + fee;
++    protocol_fee_revenue += fee;
++    swap_reserve += value;
++    swap_locked_total += value;
++    addNullifier(args.nullifier_1);
++    addNullifier(args.nullifier_2);
++    tree_state := ?next;
++    note_root := rootAfter;
++    addRoot(rootAfter);
++    let nullifiers = [args.nullifier_1, args.nullifier_2];
++    appendBlock(args.output_1, nullifiers, args.anchor, rootAfter, #confidential_transfer);
++    appendBlock(args.output_2, nullifiers, args.anchor, rootAfter, #confidential_transfer);
++    let lock : SwapLock = {
++      lock_id = Nat64.fromNat(List.size(swap_locks));
++      owner = args.owner;
++      terms = args.terms;
++      amount = args.v_pub_out;
++      fee = args.fee;
++      time = Time.now();
++    };
++    List.add(swap_locks, lock);
++    epoch += 1;
++    refreshCertification();
++    #ok(lock)
++  };
++
++  /// Collect: verify a deposit proof for exactly the owed amount, append the note, and lower the
++  /// reserve record, refusing below it. At most once per owed id: a second collect of the same id
++  /// answers ALREADY-COLLECTED, which is how the swap canister learns of a collect whose reply it
++  /// lost.
++  public shared ({ caller }) func swap_collect(args : SwapCollectArgs) : async Result<Nat> {
++    if (not isSwapCanister(caller)) return #err("REJECT:not-swap-canister");
++    switch (guardRejection()) { case (?message) return #err(message); case null {} };
++    if (Map.containsKey(swap_collected, Nat64.compare, args.owed_id)) return #err("ALREADY-COLLECTED");
++    switch (swapIntakeRejection()) { case (?e) return #err(e); case null {} };
++    let amount = Nat64.toNat(args.amount);
++    if (amount == 0) return #err("REJECT:swap-zero-value");
++    if (amount > swap_reserve) return #err("REJECT:swap-reserve-floor");
++    let output : OutputRecord = {
++      commitment = args.commitment;
++      ephemeral_key = args.ephemeral_key;
++      note_ciphertext = args.note_ciphertext;
++    };
++    switch (validateOutput(output)) { case (?e) return #err(e); case null {} };
++    switch (shapeRejection(output.ephemeral_key, output.note_ciphertext)) { case (?e) return #err(e); case null {} };
++    // the shield seam (audit F3): the value enters the statement only through nat64Field
++    let inputs = switch (serializePublicInputs([args.commitment, nat64Field(args.amount)])) {
++      case (?encoded) encoded;
++      case null return #err("REJECT:public-input-encoding");
++    };
++    let startEpoch = epoch;
++    let paid = takePaid<system>();
++    if (not paid) {
++      switch (swapUnpaidGate()) { case (?e) return #err(e); case null {} };
++    };
++    let verdict = verifyShieldProof(args.proof_hex, inputs);
++    if (verdict != "ACCEPT") {
++      recordFailedVerification(verdict, if (paid) null else ?swap_proof_gate);
++      return #err(verdict);
++    };
++    let treeBefore = currentTree();
++    let leaves = [blobToHex(args.commitment)];
++    switch (PoseidonTree.parseFieldElement(leaves[0])) { case (?_) {}; case null return #err("REJECT:commitment-noncanonical") };
++    let localNext = switch (frontierLocalNext(treeBefore, leaves)) {
++      case (#ok(value)) value;
++      case (#err(message)) return #err(message);
++    };
++    let transition = switch (localNext) {
++      case (?local) {
++        if (tree_oracle_id == null) { { state = ?local; error = null } : TreeTransition } else {
++          try { await treeActor().append(treeBefore, leaves) } catch (error) {
++            return #err("REJECT:tree-oracle-call:" # Error.message(error));
++          }
++        }
++      };
++      case null {
++        try { await treeActor().append(treeBefore, leaves) } catch (error) {
++          return #err("REJECT:tree-oracle-call:" # Error.message(error));
++        }
++      };
++    };
++    // Every check made before the await, made again: a concurrent collect of the same id, or one
++    // that drew the reserve down, must not both pass.
++    if (Map.containsKey(swap_collected, Nat64.compare, args.owed_id)) return #err("ALREADY-COLLECTED");
++    switch (swapIntakeRejection()) { case (?e) return #err(e); case null {} };
++    if (epoch != startEpoch) return #err("REJECT:state-changed");
++    if (not swapTreeUnchanged(treeBefore)) return #err("REJECT:state-changed");
++    if (amount > swap_reserve) return #err("REJECT:swap-reserve-floor");
++    let next = switch (parseTransition(transition)) {
++      case (#ok(state)) state;
++      case (#err(message)) return #err(message);
++    };
++    switch (frontierCrossCheck(localNext, next, "swap-collect")) { case (?message) return #err(message); case null {} };
++    let rootAfter = switch (hexToBlob(next.root)) {
++      case (?root) root;
++      case null return #err("REJECT:tree-root-hex");
++    };
++    let anchorBefore = note_root;
++    swap_reserve -= amount;
++    pool_value += amount;
++    swap_collected_total += amount;
++    Map.add(swap_collected, Nat64.compare, args.owed_id, amount);
++    tree_state := ?next;
++    note_root := rootAfter;
++    addRoot(rootAfter);
++    appendBlock(output, [], anchorBefore, rootAfter, #shield);
++    epoch += 1;
++    refreshCertification();
++    #ok(amount)
++  };
++
++  /// Move the protocol's part of swap fees from the reserve record into this pool's revenue, where
++  /// the pool's protocol-fee settings pay it on. At most once per sweep id.
++  public shared ({ caller }) func swap_fee_sweep(sweepId : Nat64, amount64 : Nat64) : async Result<Nat> {
++    if (not isSwapCanister(caller)) return #err("REJECT:not-swap-canister");
++    let amount = Nat64.toNat(amount64);
++    switch (guardRejection()) { case (?message) return #err(message); case null {} };
++    if (Map.containsKey(swap_sweeps, Nat64.compare, sweepId)) return #err("ALREADY-SWEPT");
++    if (amount == 0) return #err("REJECT:swap-zero-value");
++    if (amount > swap_reserve) return #err("REJECT:swap-reserve-floor");
++    swap_reserve -= amount;
++    protocol_fee_revenue += amount;
++    swap_swept_total += amount;
++    Map.add(swap_sweeps, Nat64.compare, sweepId, amount);
++    #ok(amount)
++  };
++
++  func swapGovernanceAccount() : ?ICRC2.Account {
++    switch (admin_binding) { case (?b) ?{ owner = b.governance; subaccount = null }; case null null }
++  };
++
++  /// Credit the DAO's seed: the ICP ledger block `block` must be a plain transfer from SNS
++  /// governance's own treasury account to this pool's account, with the seed memo, never credited
++  /// before. ICP pool only. ICP that reaches the account any other way is never reserve.
++  public shared ({ caller }) func swap_reserve_credit(block : Nat64) : async Result<Nat> {
++    if (not isSwapCanister(caller)) return #err("REJECT:not-swap-canister");
++    switch (guardRejection()) { case (?message) return #err(message); case null {} };
++    if (not tokenConfigured()) return #err("REJECT:token-unconfigured");
++    if (not token_history_icp) return #err("REJECT:swap-credit-icp-only");
++    let governance = switch (swapGovernanceAccount()) { case (?a) a; case null return #err("REJECT:not-bound") };
++    if (Map.containsKey(swap_credited_blocks, Nat64.compare, block)) return #err("ALREADY-CREDITED");
++    let found = switch (await fetchIcpBlock(Nat64.toNat(block))) {
++      case (#found(value)) value;
++      case (#absent) return #err("REJECT:swap-credit-block-absent");
++      case (#error(message)) return #err("REJECT:swap-credit-fetch:" # message);
++    };
++    switch (guardRejection()) { case (?message) return #err(message); case null {} };
++    if (Map.containsKey(swap_credited_blocks, Nat64.compare, block)) return #err("ALREADY-CREDITED");
++    let (from, to, amount, spender) = switch (found.transaction.operation) {
++      case (?#Transfer(op)) (op.from, op.to, op.amount.e8s, op.spender);
++      case _ return #err("REJECT:swap-credit-not-a-transfer");
++    };
++    if (spender != null) return #err("REJECT:swap-credit-spender");
++    if (not Blob.equal(from, Principal.toLedgerAccount(governance.owner, governance.subaccount))) return #err("REJECT:swap-credit-sender");
++    let pool = poolAccount();
++    if (not Blob.equal(to, Principal.toLedgerAccount(pool.owner, pool.subaccount))) return #err("REJECT:swap-credit-receiver");
++    if (found.transaction.memo != SWAP_SEED_MEMO) return #err("REJECT:swap-credit-memo");
++    if (amount == 0) return #err("REJECT:swap-zero-value");
++    let value = Nat64.toNat(amount);
++    swap_reserve += value;
++    swap_credited_total += value;
++    Map.add(swap_credited_blocks, Nat64.compare, block, value);
++    #ok(value)
++  };
++
++  /// Pay `total` out of the reserve record to SNS governance's own treasury account (ICP pool
++  /// only): `total` leaves the record, `total - token fee` reaches the account. Crash-safe and
++  /// resumable on the prepaid rail (resume_prepaid); swap_payout_state tells the swap canister
++  /// whether it finished.
++  public shared ({ caller }) func swap_reserve_payout(total : Nat64, createdAt : Nat64) : async Result<Nat> {
++    if (not isSwapCanister(caller)) return #err("REJECT:not-swap-canister");
++    switch (guardRejection()) { case (?message) return #err(message); case null {} };
++    if (not tokenConfigured()) return #err("REJECT:token-unconfigured");
++    if (not token_history_icp) return #err("REJECT:swap-payout-icp-only");
++    if (pending_prepaid != null) return #err("REJECT:pending-prepaid-mutation");
++    let governance = switch (swapGovernanceAccount()) { case (?a) a; case null return #err("REJECT:not-bound") };
++    if (Nat64.toNat(total) <= transparent_ledger_fee) return #err("REJECT:swap-payout-below-fee");
++    if (Nat64.toNat(total) > swap_reserve) return #err("REJECT:swap-reserve-floor");
++    await prepaidPayout(caller, #swap_reserve, governance, Nat64.fromNat(Nat64.toNat(total) - transparent_ledger_fee), createdAt)
++  };
++
++  public query func swap_payout_state(total : Nat64, createdAt : Nat64) : async SwapPayoutState {
++    let governance = switch (swapGovernanceAccount()) { case (?a) a; case null return #none };
++    if (Nat64.toNat(total) <= transparent_ledger_fee) return #none;
++    let id = prepaidWithdrawIntentId(SWAP_CANISTER, #swap_reserve, governance, Nat64.fromNat(Nat64.toNat(total) - transparent_ledger_fee), createdAt);
++    if (prepaidCompleted(id)) return #done;
++    switch (pending_prepaid) { case (?p) { if (Blob.equal(p.intent_id, id)) return #pending }; case null {} };
++    #none
++  };
++
++  func swapStatusValue() : SwapStatus {
++    let swapGateView = ProofGate.view(swap_proof_gate, gateConfig(), nowNs());
++    {
++      enabled = swap_enabled;
++      swap_canister = SWAP_CANISTER;
++      reserve = swap_reserve;
++      locked_total = swap_locked_total;
++      collected_total = swap_collected_total;
++      swept_total = swap_swept_total;
++      credited_total = swap_credited_total;
++      paid_total = swap_paid_total;
++      lock_count = List.size(swap_locks);
++      collect_count = Map.size(swap_collected);
++      sweep_count = Map.size(swap_sweeps);
++      payout_pending = switch (pending_prepaid) {
++        case (?p) { switch (p.op) { case (#withdraw(op)) op.source == #swap_reserve; case (#deposit(_)) false } };
++        case null false;
++      };
++      unpaid_proof_failures = swapGateView.failures;
++      unpaid_proof_budget_spent = swapGateView.spent;
++    }
++  };
++
++  public query func swap_status() : async SwapStatus { swapStatusValue() };
++
++  /// The lock log from `start`, at most 200 entries.
++  public query func swap_locks_page(start : Nat64, count : Nat64) : async [SwapLock] {
++    let n = List.size(swap_locks);
++    let from = Nat64.toNat(start);
++    if (from >= n) return [];
++    let len = Nat.min(Nat.min(Nat64.toNat(count), SWAP_PAGE_MAX), n - from);
++    Array.tabulate<SwapLock>(len, func(i) { List.at(swap_locks, from + i) })
++  };
++
++  /// Whether an owed id was collected, and for how much.
++  public query func swap_collected_amount(owedId : Nat64) : async ?Nat {
++    Map.get(swap_collected, Nat64.compare, owedId)
++  };
++
++  public query func swap_swept_amount(sweepId : Nat64) : async ?Nat {
++    Map.get(swap_sweeps, Nat64.compare, sweepId)
++  };
++
++  /// Whether an ICP ledger block was credited to the reserve, and for how much.
++  public query func swap_credited_amount(block : Nat64) : async ?Nat {
++    Map.get(swap_credited_blocks, Nat64.compare, block)
++  };
++
++  /// The binding a lock by `owner` with `terms` must prove in this pool.
++  public query func swap_lock_binding(owner : Principal, terms : Blob) : async Result<Blob> {
++    if (terms.size() == 0 or terms.size() > SWAP_TERMS_MAX) return #err("REJECT:swap-terms-size");
++    swapLockBindingValue(owner, terms)
++  };
++
++  /// Turn locks and collects on or off (generic function target). Fee sweeps, seed credits and
++  /// payouts are not switched: they never create or pay a note, and the DAO must be able to take
++  /// its liquidity back while swaps are off.
++  public shared ({ caller }) func dao_set_swap_enabled(enabled : Bool) : async () {
++    if (not isBoundGovernance(caller)) Runtime.trap("REJECT:not-governance");
++    switch (guardRejection()) { case (?message) Runtime.trap(message); case null {} };
++    swap_enabled := enabled;
++  };
++
++  public shared func validate_dao_set_swap_enabled(enabled : Bool) : async { #Ok : Text; #Err : Text } {
++    #Ok((if (enabled) "turn private-swap locks and collects ON" else "turn private-swap locks and collects OFF")
++      # " in this pool; swap canister " # Principal.toText(SWAP_CANISTER) # "; reserve record " # Nat.toText(swap_reserve))
++  };
++
+   // ==================== proof gate ====================
+   // See the state-level comment at proof_guard.
+ 
+@@ -5821,12 +6336,19 @@ persistent actor ZkLedger {
+   };
+ 
+   /// Count a failed verification (any verdict but ACCEPT, except an unconfigured verifier, which
+-  /// is no one's forgery); one on the free path also advances the gate. Runs in the same message
+-  /// segment as the verify and the rejection, so the count commits with the answer.
+-  func recordFailedVerification(verdict : Text, paid : Bool) {
++  /// is no one's forgery); an unpaid one also advances the gate it passed (`unpaid`). Runs in the
++  /// same message segment as the verify and the rejection, so the count commits with the answer.
++  func recordFailedVerification(verdict : Text, unpaid : ?ProofGate.Gate) {
+     if (verdict == "ACCEPT" or verdict == "REJECT:unconfigured") return;
+     forged_failures_total += 1;
+-    if (not paid) ProofGate.fail(proof_gate, gateConfig());
++    switch (unpaid) { case (?g) ProofGate.fail(g, gateConfig()); case null {} };
++  };
++
++  /// An unpaid swap_lock / swap_collect: refused before verifying while the window's budget of
++  /// failed unpaid swap verifications is spent. The swap canister checked the caller's work.
++  func swapUnpaidGate() : ?Text {
++    let v = ProofGate.roll(swap_proof_gate, gateConfig(), nowNs());
++    if (v.spent) ?"REJECT:swap-proof-budget-spent" else null
+   };
+ 
+   func proofGuardStatusValue() : ProofGuardStatus {
+@@ -6099,7 +6621,7 @@ persistent actor ZkLedger {
+     };
+     let verdict = verifyTransferProof(args.proof_hex, inputs);
+     if (verdict != "ACCEPT") {
+-      recordFailedVerification(verdict, paid);
++      recordFailedVerification(verdict, if (paid) null else ?proof_gate);
+       return mutation(verdict, verdict);
+     };
+ 
+@@ -6344,11 +6866,11 @@ persistent actor ZkLedger {
+   // Every ingress message passes here before it is decoded or charged (`inspect` costs the
+   // canister nothing). Calls from canisters never do, which is why every argument a caller sizes
+   // is fixed-width. Refused: a query sent as an update (it would run at this canister's expense);
+-  // the self-calls; governance's, an administrator's, controller's or fee collector's method from
+-  // anyone else; any other argument above its method's size; a free shield or transfer that would
+-  // fail the proof gate. The administrator's and governance's own messages are not size-limited.
+-  // Governance's methods are admitted only from the bound governance, which as a canister never
+-  // sends ingress: on the IC they never pass here at all.
++  // the self-calls; governance's, the swap canister's (swap_*), an administrator's, controller's or
++  // fee collector's method from anyone else; any other argument above its method's size; a free
++  // shield or transfer that would fail the proof gate. The administrator's and governance's own
++  // messages are not size-limited. Governance's and the swap canister's methods are admitted only
++  // from them, and as canisters they never send ingress: on the IC those calls never pass here.
+   //
+   // Sizes: methods with fixed argument types (resume_*, prepaid_fee_*, protocol_fee_sweep,
+   // protocol_treasury_withdraw) FIXED_ARG_BYTES. shield and confidential_transfer: the largest
+@@ -6412,6 +6934,10 @@ persistent actor ZkLedger {
+       #dao_resume_shield : Any; #dao_resume_unshield : Any; #dao_resume_prepaid : Any;
+       #validate_dao_resume_shield : Any; #validate_dao_resume_unshield : Any;
+       #validate_dao_resume_prepaid : Any; #protocol_fee_sweep : Any; #protocol_treasury_withdraw : Any;
++      #swap_lock : Any; #swap_collect : Any; #swap_fee_sweep : Any; #swap_reserve_credit : Any;
++      #swap_reserve_payout : Any; #swap_payout_state : Any; #swap_status : Any; #swap_locks_page : Any;
++      #swap_collected_amount : Any; #swap_swept_amount : Any; #swap_credited_amount : Any;
++      #swap_lock_binding : Any; #dao_set_swap_enabled : Any; #validate_dao_set_swap_enabled : Any;
+       #forged_proof_guard_status : Any; #set_proof_guard : Any; #dao_set_proof_guard : Any;
+       #validate_dao_set_proof_guard : Any; #claim_envelopes : Any; #claim_status : Any;
+       #set_claim_envelopes_required : Any; #get_note_shape : Any; #set_note_shape : Any;
+@@ -6428,10 +6954,13 @@ persistent actor ZkLedger {
+         #set_prepaid_fee_rate _ or #prepaid_fee_collect _ or #set_protocol_fee _ or #set_proof_guard _ or
+         #set_claim_envelopes_required _ or #set_note_shape _) isAdministrator(caller);
+       case (#configure _) Principal.isController(caller);
++      case (#swap_lock _ or #swap_collect _ or #swap_fee_sweep _ or #swap_reserve_credit _ or #swap_reserve_payout _) isSwapCanister(caller);
+       case (#dao_set_protocol_fee _ or #validate_dao_set_protocol_fee _ or #dao_resume_shield _ or
+         #dao_resume_unshield _ or #dao_resume_prepaid _ or #validate_dao_resume_shield _ or
+         #validate_dao_resume_unshield _ or #validate_dao_resume_prepaid _ or #dao_set_proof_guard _ or
+-        #validate_dao_set_proof_guard _) isBoundGovernance(caller);
++        #validate_dao_set_proof_guard _ or
++        #dao_set_swap_enabled _ or
++        #validate_dao_set_swap_enabled _) isBoundGovernance(caller);
+       case (#protocol_fee_sweep _ or #protocol_treasury_withdraw _) arg.size() <= FIXED_ARG_BYTES and mayCollectProtocolFees(caller);
+       case (#resume_shield _ or #resume_unshield _ or #resume_prepaid _ or #prepaid_fee_deposit _ or
+         #prepaid_fee_withdraw _) arg.size() <= FIXED_ARG_BYTES;
+diff --git a/pool/src/ProofGuardMigration.mo b/pool/src/ProofGuardMigration.mo
+deleted file mode 100644
+index 29f40a2..0000000
+--- a/pool/src/ProofGuardMigration.mo
++++ /dev/null
+@@ -1,16 +0,0 @@
+-/// The upgrade that replaces the forged-proof cool-down with the proof gate (`ProofGate.mo`):
+-/// the cool-down's configuration and its window, count, deadline and trip counter are consumed.
+-/// `forged_failures_total` (failed proof verifications since install) is kept as it is. A later
+-/// upgrade from a module that already has the gate carries no migration.
+-module {
+-  public func migrate(old : {
+-    var forged_guard : { threshold : Nat; window_seconds : Nat; cooldown_seconds : Nat };
+-    var forged_window_start : Int;
+-    var forged_in_window : Nat;
+-    var forged_cooldown_until : Int;
+-    var forged_trips : Nat;
+-  }) : {} {
+-    ignore old;
+-    {}
+-  };
+-};

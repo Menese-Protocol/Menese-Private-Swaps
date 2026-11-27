@@ -1,0 +1,456 @@
+type Validation = 
+ variant {
+   Err: text;
+   Ok: text;
+ };
+type TreasuryChange = 
+ variant {
+   RecordSeed: record {block: nat64;};
+   Withdraw: record {
+               min_icp_e8s: nat64;
+               shares: nat64;
+             };
+ };
+type Terms = 
+ record {
+   bound: nat64;
+   kind: Kind;
+   nonce: blob;
+   target: principal;
+ };
+type SwapLockArgs = 
+ record {
+   anchor: blob;
+   fee: nat64;
+   nullifier_1: blob;
+   nullifier_2: blob;
+   output_1: OutputRecord;
+   output_2: OutputRecord;
+   owner: principal;
+   proof_hex: text;
+   terms: blob;
+   v_pub_out: nat64;
+ };
+type Swap = 
+ service {
+   /// The books cross-check (v2 §6), readable by anyone: each pool's own reserve record beside
+   /// these books. A composite query, so it reads pools on this canister's subnet.
+   books_view: () ->
+    (vec
+      record {
+        books: int;
+        equal: bool;
+        parts: nat;
+        pool: principal;
+        reserve_record: nat;
+        symbol: text;
+        verdict: text;
+      }) composite_query;
+   /// Collect an owed amount as a note: the owner's deposit proof for exactly the amount, verified
+   /// and appended by the paying pool. A collect whose reply was lost is finished by asking again.
+   /// The pool's verification is paid or free, as `lock`'s; a record whose free collect failed
+   /// verification waits before its next free one.
+   collect: (args: CollectArgs) -> (Result);
+   /// A provider's shares as receipt notes: one or two deposit proofs whose values sum to exactly
+   /// the shares owed (a second note, which may be worth 0, lets a later leave spend two inputs as
+   /// the transfer statement requires), verified here against the frozen deposit statement and
+   /// appended to this canister's own tree.
+   collect_receipt: (args:
+    record {
+      notes: vec ReceiptNote;
+      receipt_id: nat64;
+      work: blob;
+    }) -> (Result);
+   /// Add a pair only if its pool proves the same frozen statements as the hub, so every pool's
+   /// notes, and this canister's receipts, are under the same two keys.
+   dao_pairs: (w: PairChange) -> ();
+   dao_settings: (w: SettingsChange) -> ();
+   dao_treasury: (w: TreasuryChange) -> ();
+   encode_terms: (t: Terms) -> (opt blob) query;
+   /// Leave: a transfer proof over receipt notes whose public value is the shares leaving, bound
+   /// to this canister and the owner, with no fee. Each asset's part, rounded down, is owed to the
+   /// owner in that asset's pool. No price is used, so a leave works while pairs are paused.
+   leave: (args: record {
+                   owner: principal;
+                   spend: Spend;
+                   work: blob;
+                 }) -> (Result_2);
+   leave_binding: (owner: principal) -> (blob) query;
+   /// Lock: forward a transfer proof to the source pool, which verifies it. Anyone may relay it:
+   /// the proof binds the owner and the terms, so a relayer can change neither. Checks here only
+   /// save a doomed lock; every one that matters is made again when the lock is priced. The pool's
+   /// verification is paid (the caller's cycles go on to the pool) or free (priced by `work` and
+   /// bounded by the failure budget, as `leave`).
+   lock: (pool: principal, args: SwapLockArgs, work: blob) -> (Result_1);
+   owed_of: (owner: principal, start64: nat64, count64: nat64) ->
+    (vec OwedView) query;
+   pending_page: (start64: nat64, count64: nat64) ->
+    (vec
+      record {
+        amount: nat;
+        deadline: nat64;
+        from: principal;
+        kind: PendingKind;
+        seq: nat;
+        t_lock: nat64;
+      }) query;
+   receipt_notes: (start: nat64, count: nat64) -> (vec Note) query;
+   receipts_owed_of: (owner: principal, start64: nat64, count64: nat64) ->
+    (vec
+      record {
+        created_ns: nat64;
+        id: nat64;
+        priced: opt Priced;
+        retry_after_ns: nat64;
+        shares: nat;
+        state: CollectState;
+      }) query;
+   /// A reporter's prices for one round, one per pair. The caller is the reporter: an update call
+   /// is signed by the sender's key and checked by the subnet before it runs.
+   report: (round_open: nat64, prices: vec PriceReport) -> (vec text);
+   /// What a reporter needs each round: this canister's clock (a reporter follows it, not its own),
+   /// the round settings, and the pools that take prices.
+   round_info: () ->
+    (record {
+       deadline_ns: nat64;
+       max_report_age_ns: nat64;
+       now: nat64;
+       pools: vec principal;
+       round_ns: nat64;
+     }) query;
+   /// A pair's accepted rounds still held (the last 512), oldest first. Anyone can audit every
+   /// price the feed accepted against the venues.
+   rounds_page: (pool: principal, start64: nat64, count64: nat64) ->
+    (vec Accepted) query;
+   /// Anyone may push the queue along; the timer does too.
+   settle: () -> (nat);
+   status: () ->
+    (record {
+       assets: vec AssetView;
+       cross_check_note: text;
+       feed: opt Settings;
+       guards: Guards;
+       joins_filled: nat;
+       leaves: nat;
+       paused: opt text;
+       pending: nat;
+       proofs:
+        record {
+          budget_spent: bool;
+          cycles_accepted: nat;
+          cycles_forwarded: nat;
+          difficulty: nat;
+          epoch: nat;
+          failures: nat;
+          inflight: nat;
+          paid_checks: nat;
+          window_ns: nat64;
+          window_start_ns: nat64;
+        };
+       receipt_keys_ready: bool;
+       receipt_root: blob;
+       refunds: nat;
+       shares:
+        record {
+          dao: nat;
+          locked: nat;
+          receipts_out: nat;
+          receipts_owed: nat;
+          total: nat;
+        };
+       swaps_filled: nat;
+       withdrawal:
+        opt record {
+              icp: nat;
+              id: nat;
+              min_icp: nat;
+              shares: nat;
+              waiting: nat;
+            };
+     }) query;
+   /// Import locks the pool committed whose replies this canister did not process. Anyone may call.
+   sync: (pool: principal) -> (Result);
+   validate_dao_pairs: (c: PairChange) -> (Validation) query;
+   validate_dao_settings: (c: SettingsChange) -> (Validation) query;
+   validate_dao_treasury: (c: TreasuryChange) -> (Validation) query;
+ };
+type Spend = 
+ record {
+   anchor: blob;
+   fee: nat64;
+   nullifier_1: blob;
+   nullifier_2: blob;
+   output_1: Note;
+   output_2: Note;
+   proof_hex: text;
+   v_pub_out: nat64;
+ };
+type SettingsChange = 
+ variant {
+   Pause: record {pool: opt principal;};
+   Resume: record {pool: opt principal;};
+   SetFeed: Settings;
+   SetGuards: Guards;
+   SetPair: record {
+              pool: principal;
+              settings: PairSettings;
+            };
+ };
+type Settings = 
+ record {
+   confirm_bps: nat64;
+   deadline_ns: nat64;
+   jump_bps: nat64;
+   jump_gap_ns: nat64;
+   k: nat64;
+   max_report_age_ns: nat64;
+   reporters: vec principal;
+   round_ns: nat64;
+   spread_bps: nat64;
+ };
+type Result_2 = 
+ variant {
+   err: text;
+   ok: vec nat64;
+ };
+type Result_1 = 
+ variant {
+   err: text;
+   ok: LockReceipt;
+ };
+type Result = 
+ variant {
+   err: text;
+   ok: nat;
+ };
+type ReceiptNote = 
+ record {
+   commitment: blob;
+   ephemeral_key: blob;
+   note_ciphertext: blob;
+   proof_hex: text;
+   value: nat64;
+ };
+type Reading = 
+ record {
+   price: nat;
+   rate_time_ns: nat64;
+   read_at_ns: nat64;
+   sources: nat;
+   spread_bps: nat;
+ };
+type Providers = 
+ variant {
+   AnyHolder;
+   Listed: vec principal;
+ };
+type Priced = 
+ record {
+   rounds: vec record {
+                 principal;
+                 nat64;
+                 nat;
+               };
+   t_lock: nat64;
+ };
+type PriceReport = 
+ record {
+   observed_at: nat64;
+   pool: principal;
+   price: Price;
+ };
+type Price = 
+ record {
+   hi: nat64;
+   lo: nat64;
+ };
+type PendingKind = 
+ variant {
+   dao_join;
+   dao_sell: record {withdrawal: nat;};
+   join: record {
+           min_shares: nat;
+           owner: principal;
+         };
+   swap: record {
+           min_out: nat;
+           owner: principal;
+           to: nat;
+         };
+ };
+type PairSettings = 
+ record {
+   band_bps: nat64;
+   cap_icp: nat64;
+   fee_bps: nat64;
+   lock_fee: nat64;
+   max_swap_bps: nat64;
+   min_depth_icp: nat64;
+   min_swap: nat64;
+   minute_cap_icp: nat64;
+   protocol_share_bps: nat64;
+ };
+type PairChange = 
+ variant {
+   Add:
+    record {
+      decimals: nat8;
+      ledger: principal;
+      pool: principal;
+      settings: PairSettings;
+      xrc_class: AssetClass;
+      xrc_symbol: text;
+    };
+   Close: record {pool: principal;};
+ };
+type OwedView = 
+ record {
+   amount: nat;
+   created_ns: nat64;
+   id: nat64;
+   kind: OwedKind;
+   owner: principal;
+   pool: principal;
+   priced: opt Priced;
+   retry_after_ns: nat64;
+   state: CollectState;
+ };
+type OwedKind = 
+ variant {
+   leave;
+   payout;
+   refund: text;
+ };
+type OutputRecord = 
+ record {
+   commitment: blob;
+   ephemeral_key: blob;
+   note_ciphertext: blob;
+ };
+type Note = 
+ record {
+   commitment: blob;
+   ephemeral_key: blob;
+   note_ciphertext: blob;
+ };
+type LockReceipt = 
+ record {
+   lock_id: nat64;
+   recorded: bool;
+ };
+type Kind = 
+ variant {
+   join;
+   swap;
+ };
+type Guards = 
+ record {
+   backoff_s: nat64;
+   fail_budget: nat64;
+   hub_lock_fee: nat64;
+   hub_min_swap: nat64;
+   join_fee_bps: nat64;
+   loss_pause_bps: nat64;
+   max_spread_bps: nat64;
+   min_sources: nat64;
+   providers: Providers;
+   stall_s: nat64;
+   timeout_s: nat64;
+   verify_price: nat64;
+   work_d_base: nat64;
+   work_d_max: nat64;
+   work_step: nat64;
+   work_window_s: nat64;
+   xrc_max_age_s: nat64;
+   xrc_refresh_s: nat64;
+ };
+type CollectState = 
+ variant {
+   collected;
+   collecting;
+   open;
+ };
+type CollectArgs = 
+ record {
+   commitment: blob;
+   ephemeral_key: blob;
+   note_ciphertext: blob;
+   owed_id: nat64;
+   proof_hex: text;
+   work: blob;
+ };
+type AssetView = 
+ record {
+   books:
+    record {
+      collecting: nat;
+      dao_due: nat;
+      fees: nat;
+      held: nat;
+      owed: nat;
+      paying: nat;
+      pending: nat;
+      reserve_record: int;
+      sweeping: nat;
+    };
+   feed_alive: bool;
+   frozen_outlier: opt principal;
+   index: nat;
+   last_round: opt Accepted;
+   late_reports: nat;
+   pool: principal;
+   rounds_accepted: nat;
+   rounds_dead: nat;
+   rounds_frozen: nat;
+   rounds_held: nat;
+   settings: opt PairSettings;
+   state: AssetState;
+   symbol: text;
+   xrc: opt Reading;
+   xrc_error: text;
+ };
+type AssetState = 
+ variant {
+   closed;
+   open;
+   paused: text;
+ };
+type AssetClass = 
+ variant {
+   Cryptocurrency;
+   FiatCurrency;
+ };
+type Accepted = 
+ record {
+   finalized_ns: nat64;
+   open_ns: nat64;
+   price: nat;
+   sample_ns: nat64;
+ };
+/// The private swap canister.
+/// 
+/// Swaps between the private pools through an ICP hub, priced by this canister's own consensus
+/// feed at the first round that opens after a lock (PROPOSAL-private-swaps-v2.md §3.5):
+/// 
+///   1. lock: a user's transfer proof, bound to the terms of the swap, is verified by the source
+///      pool (`swap_lock`); the value leaves the user's notes into the pool's reserve record;
+///   2. price: the first accepted feed round that opened after the lock prices it, if one is
+///      finalized before the lock's timeout and the Exchange Rate Canister agrees within the band;
+///      otherwise the whole locked value is owed back in the source pool;
+///   3. collect: the user's deposit proof for exactly the owed amount is verified by the paying
+///      pool (`swap_collect`), which appends the note.
+/// 
+/// Calls go one way, this canister to the pools; every pool method it calls is idempotent by an
+/// id it chooses, so a lost reply is recovered by asking again. Nothing is written before an
+/// await that an error return would have to undo, except the in-flight markers that the books
+/// count as in flight.
+/// 
+/// Liquidity providers hold shares of one reserve across every asset, as private receipt notes in
+/// this canister's own tree; the DAO holds shares publicly.
+service : (init: record {
+                   feed: opt Settings;
+                   guards: opt Guards;
+                   hub_pool: principal;
+                   sns_governance: principal;
+                   xrc: principal;
+                 }) -> Swap

@@ -1,0 +1,8 @@
+Source of the pool modules this upgrade starts from (public mirror Menese-Protocol/Shielded-Ledger-Hivemind):
+  ckBTC pool  mirror commit aa2a6e0fa418ca972e9951b721466f884a9bce1d  module sha256 4c26e0669b33f03679fc9fa11e8aa06e760b4b8beccf54edf601022d8a08014b
+  ICP pool    mirror commit df853eb8145045d42a7f8b12095eb8aaec671a2a  module sha256 df8453a91cda7dc894024219ecfcabdbc1dc6660b37138d551eca4a24e52be6e
+Both rebuild byte-exact with moc 1.4.1 and mops (core 1.0.0, sha2 0.1.9), and with ../build.sh --upstream
+(UPSTREAM_SRC=<that commit's src/>), which stages the same layout from the vendored packages:
+  ckBTC: moc $(mops sources) src/Main.mo --public-metadata candid:service
+  ICP:   moc $(mops sources) src/Main.mo --public-metadata candid:service --public-metadata candid:args
+src/ is the ckBTC tree. The ICP tree is the same except the three files in icp-overrides/ (Main.mo is identical).
