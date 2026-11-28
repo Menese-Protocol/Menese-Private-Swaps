@@ -152,8 +152,12 @@ persistent actor ZkLedger {
   /// One length for every new output's opaque fields, so outputs from different wallets (or a
   /// claimable payment and any other transfer) cannot be told apart by size.
   public type NoteShape = { ephemeral_key_len : Nat; note_ciphertext_len : Nat };
-  /// `set_note_shape`'s argument: the same lengths, fixed-width on the wire.
+  /// The lengths to set, fixed-width on the wire.
   public type NoteShapeArg = { ephemeral_key_len : Nat64; note_ciphertext_len : Nat64 };
+  /// `set_note_shape`'s argument: setting and clearing are each named. An argument of an earlier
+  /// type (an optional record, which Candid would read as null when its record does not match) is
+  /// refused while decoding, so no encoding mistake can clear the shape.
+  public type NoteShapeChange = { #set : NoteShapeArg; #clear };
   public type ClaimStatus = {
     required : Bool;
     envelope_len : Nat;
@@ -6442,11 +6446,11 @@ persistent actor ZkLedger {
 
   public query func get_note_shape() : async ?NoteShape { note_shape };
 
-  /// Fix (or clear, with null) the opaque-field lengths of every new output. Administrator only.
-  public shared ({ caller }) func set_note_shape(shapeArg : ?NoteShapeArg) : async Result<?NoteShape> {
-    let shape : ?NoteShape = switch (shapeArg) {
-      case (?a) ?{ ephemeral_key_len = Nat64.toNat(a.ephemeral_key_len); note_ciphertext_len = Nat64.toNat(a.note_ciphertext_len) };
-      case null null;
+  /// Fix (`#set`) or clear (`#clear`) the opaque-field lengths of every new output. Administrator only.
+  public shared ({ caller }) func set_note_shape(change : NoteShapeChange) : async Result<?NoteShape> {
+    let shape : ?NoteShape = switch (change) {
+      case (#set a) ?{ ephemeral_key_len = Nat64.toNat(a.ephemeral_key_len); note_ciphertext_len = Nat64.toNat(a.note_ciphertext_len) };
+      case (#clear) null;
     };
     switch (guardRejection()) { case (?message) return #err(message); case null {} };
     if (not isAdministrator(caller)) return #err("REJECT:not-administrator");

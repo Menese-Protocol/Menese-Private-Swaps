@@ -111,6 +111,13 @@ entry points. The hardening release changes the pools' interface; clients of the
   gate; `set_proof_guard` (administrator) and `dao_set_proof_guard` (governance) set it within the same
   hard limits. The earlier cool-down and its methods are removed.
 
+`SWAP-DIFF.patch` changes one existing argument. `set_note_shape` takes
+`variant { set : NoteShapeArg; clear }` where the hardening release takes `opt NoteShapeArg`. Candid
+decodes an optional value of the wrong type as `null`, so on the hardening release a client still sending
+`nat` lengths clears the note shape and the call replies ok; administrator tools read the shape back with
+`get_note_shape` after every set. With the variant, an argument of either earlier type, `null` included,
+is refused while decoding, and the note shape is cleared only by `clear`.
+
 ## Settings
 
 Every setting changes only through `dao_*` methods, which refuse every caller except the SNS governance

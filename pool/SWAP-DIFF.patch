@@ -1,5 +1,5 @@
 diff --git a/pool/src/Main.mo b/pool/src/Main.mo
-index 62a6fc9..3d29b29 100644
+index 62a6fc9..038dec4 100644
 --- a/pool/src/Main.mo
 +++ b/pool/src/Main.mo
 @@ -46,11 +46,10 @@ import NoteCodec "NoteCodec";
@@ -15,7 +15,21 @@ index 62a6fc9..3d29b29 100644
  persistent actor ZkLedger {
    public type Result<T> = { #ok : T; #err : Text };
  
-@@ -280,8 +279,9 @@ persistent actor ZkLedger {
+@@ -153,8 +152,12 @@ persistent actor ZkLedger {
+   /// One length for every new output's opaque fields, so outputs from different wallets (or a
+   /// claimable payment and any other transfer) cannot be told apart by size.
+   public type NoteShape = { ephemeral_key_len : Nat; note_ciphertext_len : Nat };
+-  /// `set_note_shape`'s argument: the same lengths, fixed-width on the wire.
++  /// The lengths to set, fixed-width on the wire.
+   public type NoteShapeArg = { ephemeral_key_len : Nat64; note_ciphertext_len : Nat64 };
++  /// `set_note_shape`'s argument: setting and clearing are each named. An argument of an earlier
++  /// type (an optional record, which Candid would read as null when its record does not match) is
++  /// refused while decoding, so no encoding mistake can clear the shape.
++  public type NoteShapeChange = { #set : NoteShapeArg; #clear };
+   public type ClaimStatus = {
+     required : Bool;
+     envelope_len : Nat;
+@@ -280,8 +283,9 @@ persistent actor ZkLedger {
          reserved : Nat;
          // #sweep moves protocol-fee revenue from the POOL account into the protocol treasury
          // subaccount (protocol_fee_sweep); #treasury pays out of that subaccount
@@ -27,7 +41,7 @@ index 62a6fc9..3d29b29 100644
          transfer_args : ICRC2.TransferArg;
        };
      };
-@@ -342,13 +342,17 @@ persistent actor ZkLedger {
+@@ -342,13 +346,17 @@ persistent actor ZkLedger {
      recipient : ?ICRC2.Account;
      revenue : Nat;
      transparent_ledger_fee : Nat;
@@ -46,7 +60,7 @@ index 62a6fc9..3d29b29 100644
    };
  
    /// The publicly visible shape of an in-flight token intent.
-@@ -4594,7 +4598,7 @@ persistent actor ZkLedger {
+@@ -4594,7 +4602,7 @@ persistent actor ZkLedger {
      };
      let verdict = verifyShieldProof(args.proof_hex, inputs);
      if (verdict != "ACCEPT") {
@@ -55,7 +69,7 @@ index 62a6fc9..3d29b29 100644
        return mutation(verdict, verdict);
      };
  
-@@ -5177,7 +5181,7 @@ persistent actor ZkLedger {
+@@ -5177,7 +5185,7 @@ persistent actor ZkLedger {
  
    func prepaidWithdrawIntentId(
      caller : Principal,
@@ -64,7 +78,7 @@ index 62a6fc9..3d29b29 100644
      to : ICRC2.Account,
      amount : Nat64,
      createdAt : Nat64,
-@@ -5190,6 +5194,7 @@ persistent actor ZkLedger {
+@@ -5190,6 +5198,7 @@ persistent actor ZkLedger {
        case (#revenue) "revenue";
        case (#sweep) "sweep";
        case (#treasury) "treasury";
@@ -72,7 +86,7 @@ index 62a6fc9..3d29b29 100644
      })));
      List.add(entries, ("to_owner", #Blob(Principal.toBlob(to.owner))));
      switch (to.subaccount) {
-@@ -5263,6 +5268,7 @@ persistent actor ZkLedger {
+@@ -5263,6 +5272,7 @@ persistent actor ZkLedger {
            case (#balance) prepaidFeeBalance(pending.caller);
            case (#revenue) prepaid_fee_revenue;
            case (#sweep or #treasury) protocol_treasury_balance;
@@ -80,7 +94,7 @@ index 62a6fc9..3d29b29 100644
          }
        };
      }
-@@ -5279,6 +5285,7 @@ persistent actor ZkLedger {
+@@ -5279,6 +5289,7 @@ persistent actor ZkLedger {
            case (#revenue) prepaid_fee_revenue += op.reserved;
            case (#sweep) protocol_fee_revenue += op.reserved;
            case (#treasury) protocol_treasury_balance += op.reserved;
@@ -88,7 +102,7 @@ index 62a6fc9..3d29b29 100644
          }
        };
      }
-@@ -5295,6 +5302,8 @@ persistent actor ZkLedger {
+@@ -5295,6 +5306,8 @@ persistent actor ZkLedger {
          // landed in the treasury subaccount (its token fee is burned by the token ledger)
          switch (op.source) {
            case (#sweep) protocol_treasury_balance += op.transfer_args.amount;
@@ -97,7 +111,7 @@ index 62a6fc9..3d29b29 100644
            case (_) {};
          };
        };
-@@ -5518,7 +5527,7 @@ persistent actor ZkLedger {
+@@ -5518,7 +5531,7 @@ persistent actor ZkLedger {
  
    func prepaidPayout(
      caller : Principal,
@@ -106,7 +120,7 @@ index 62a6fc9..3d29b29 100644
      to : ICRC2.Account,
      amount : Nat64,
      createdAt : Nat64,
-@@ -5530,6 +5539,7 @@ persistent actor ZkLedger {
+@@ -5530,6 +5543,7 @@ persistent actor ZkLedger {
          case (#balance) prepaidFeeBalance(caller);
          case (#revenue) prepaid_fee_revenue;
          case (#sweep or #treasury) protocol_treasury_balance;
@@ -114,7 +128,7 @@ index 62a6fc9..3d29b29 100644
        }
      };
      if (prepaidCompleted(intentId)) return #ok(answer());
-@@ -5537,7 +5547,7 @@ persistent actor ZkLedger {
+@@ -5537,7 +5551,7 @@ persistent actor ZkLedger {
        // Unswept protocol revenue is held in the POOL account (it never left it); swept revenue in
        // the treasury subaccount; prepaid custody in its own.
        from_subaccount = switch (source) {
@@ -123,7 +137,7 @@ index 62a6fc9..3d29b29 100644
          case (#treasury) ?protocol_treasury_subaccount;
          case (_) ?prepaid_fee_subaccount;
        };
-@@ -5572,6 +5582,10 @@ persistent actor ZkLedger {
+@@ -5572,6 +5586,10 @@ persistent actor ZkLedger {
          if (protocol_treasury_balance < reserved) return #err("REJECT:protocol-treasury-insufficient");
          protocol_treasury_balance -= reserved;
        };
@@ -134,7 +148,7 @@ index 62a6fc9..3d29b29 100644
      };
      pending_prepaid := ?{
        intent_id = intentId;
-@@ -5631,9 +5645,10 @@ persistent actor ZkLedger {
+@@ -5631,9 +5649,10 @@ persistent actor ZkLedger {
        recipient = protocol_fee_recipient;
        revenue = protocol_fee_revenue;
        transparent_ledger_fee;
@@ -146,7 +160,7 @@ index 62a6fc9..3d29b29 100644
      }
    };
  
-@@ -5780,6 +5795,506 @@ persistent actor ZkLedger {
+@@ -5780,6 +5799,506 @@ persistent actor ZkLedger {
      await prepaidPayout(caller, #treasury, to, amount, createdAt)
    };
  
@@ -653,7 +667,7 @@ index 62a6fc9..3d29b29 100644
    // ==================== proof gate ====================
    // See the state-level comment at proof_guard.
  
-@@ -5821,12 +6336,19 @@ persistent actor ZkLedger {
+@@ -5821,12 +6340,19 @@ persistent actor ZkLedger {
    };
  
    /// Count a failed verification (any verdict but ACCEPT, except an unconfigured verifier, which
@@ -677,7 +691,24 @@ index 62a6fc9..3d29b29 100644
    };
  
    func proofGuardStatusValue() : ProofGuardStatus {
-@@ -6099,7 +6621,7 @@ persistent actor ZkLedger {
+@@ -5920,11 +6446,11 @@ persistent actor ZkLedger {
+ 
+   public query func get_note_shape() : async ?NoteShape { note_shape };
+ 
+-  /// Fix (or clear, with null) the opaque-field lengths of every new output. Administrator only.
+-  public shared ({ caller }) func set_note_shape(shapeArg : ?NoteShapeArg) : async Result<?NoteShape> {
+-    let shape : ?NoteShape = switch (shapeArg) {
+-      case (?a) ?{ ephemeral_key_len = Nat64.toNat(a.ephemeral_key_len); note_ciphertext_len = Nat64.toNat(a.note_ciphertext_len) };
+-      case null null;
++  /// Fix (`#set`) or clear (`#clear`) the opaque-field lengths of every new output. Administrator only.
++  public shared ({ caller }) func set_note_shape(change : NoteShapeChange) : async Result<?NoteShape> {
++    let shape : ?NoteShape = switch (change) {
++      case (#set a) ?{ ephemeral_key_len = Nat64.toNat(a.ephemeral_key_len); note_ciphertext_len = Nat64.toNat(a.note_ciphertext_len) };
++      case (#clear) null;
+     };
+     switch (guardRejection()) { case (?message) return #err(message); case null {} };
+     if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
+@@ -6099,7 +6625,7 @@ persistent actor ZkLedger {
      };
      let verdict = verifyTransferProof(args.proof_hex, inputs);
      if (verdict != "ACCEPT") {
@@ -686,7 +717,7 @@ index 62a6fc9..3d29b29 100644
        return mutation(verdict, verdict);
      };
  
-@@ -6344,11 +6866,11 @@ persistent actor ZkLedger {
+@@ -6344,11 +6870,11 @@ persistent actor ZkLedger {
    // Every ingress message passes here before it is decoded or charged (`inspect` costs the
    // canister nothing). Calls from canisters never do, which is why every argument a caller sizes
    // is fixed-width. Refused: a query sent as an update (it would run at this canister's expense);
@@ -703,7 +734,7 @@ index 62a6fc9..3d29b29 100644
    //
    // Sizes: methods with fixed argument types (resume_*, prepaid_fee_*, protocol_fee_sweep,
    // protocol_treasury_withdraw) FIXED_ARG_BYTES. shield and confidential_transfer: the largest
-@@ -6412,6 +6934,10 @@ persistent actor ZkLedger {
+@@ -6412,6 +6938,10 @@ persistent actor ZkLedger {
        #dao_resume_shield : Any; #dao_resume_unshield : Any; #dao_resume_prepaid : Any;
        #validate_dao_resume_shield : Any; #validate_dao_resume_unshield : Any;
        #validate_dao_resume_prepaid : Any; #protocol_fee_sweep : Any; #protocol_treasury_withdraw : Any;
@@ -714,7 +745,7 @@ index 62a6fc9..3d29b29 100644
        #forged_proof_guard_status : Any; #set_proof_guard : Any; #dao_set_proof_guard : Any;
        #validate_dao_set_proof_guard : Any; #claim_envelopes : Any; #claim_status : Any;
        #set_claim_envelopes_required : Any; #get_note_shape : Any; #set_note_shape : Any;
-@@ -6428,10 +6954,13 @@ persistent actor ZkLedger {
+@@ -6428,10 +6958,13 @@ persistent actor ZkLedger {
          #set_prepaid_fee_rate _ or #prepaid_fee_collect _ or #set_protocol_fee _ or #set_proof_guard _ or
          #set_claim_envelopes_required _ or #set_note_shape _) isAdministrator(caller);
        case (#configure _) Principal.isController(caller);
